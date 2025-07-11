@@ -10,11 +10,24 @@
 (define-constant ERR_PROPOSAL_NOT_FOUND (err u108))
 (define-constant ERR_ALREADY_VOTED (err u109))
 (define-constant ERR_VOTING_ENDED (err u110))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u111))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u112))
+(define-constant ERR_DISPUTE_NOT_OPEN (err u113))
+(define-constant ERR_ALREADY_ARBITRATOR (err u114))
+(define-constant ERR_INSUFFICIENT_ARBITRATORS (err u115))
+(define-constant ERR_CANNOT_ARBITRATE_OWN_DISPUTE (err u116))
+(define-constant ERR_DISPUTE_ALREADY_RESOLVED (err u117))
+(define-constant ERR_NOT_ARBITRATOR (err u118))
+(define-constant ERR_ALREADY_RULED (err u119))
+(define-constant ERR_INVALID_RULING (err u120))
 
 (define-data-var delivery-counter uint u0)
 (define-data-var proposal-counter uint u0)
 (define-data-var dao-treasury uint u0)
 (define-data-var platform-fee-percentage uint u5)
+(define-data-var dispute-counter uint u0)
+(define-data-var minimum-arbitrators uint u3)
+(define-data-var arbitration-reward uint u1000000)
 
 (define-map deliveries
   uint
@@ -62,6 +75,38 @@
 (define-map driver-ratings
   { delivery-id: uint }
   { rating: uint, rated-by: principal }
+)
+
+(define-map disputes
+  uint
+  {
+    delivery-id: uint,
+    complainant: principal,
+    respondent: principal,
+    reason: (string-ascii 200),
+    status: (string-ascii 20),
+    created-at: uint,
+    resolved-at: (optional uint),
+    arbitrators: (list 5 principal),
+    ruling: (optional (string-ascii 20)),
+    votes-for-complainant: uint,
+    votes-for-respondent: uint,
+    escrowed-amount: uint
+  }
+)
+
+(define-map arbitration-pool
+  principal
+  {
+    available: bool,
+    disputes-arbitrated: uint,
+    reputation-score: uint
+  }
+)
+
+(define-map arbitration-votes
+  { dispute-id: uint, arbitrator: principal }
+  { vote: (string-ascii 20), timestamp: uint }
 )
 
 (define-public (register-driver (name (string-ascii 50)))
@@ -251,4 +296,217 @@
 
 (define-read-only (get-driver-rating (delivery-id uint))
   (map-get? driver-ratings { delivery-id: delivery-id })
+)
+
+(define-public (register-arbitrator)
+  (let
+    (
+      (driver-info (unwrap! (map-get? drivers tx-sender) ERR_NOT_AUTHORIZED))
+    )
+    (asserts! (>= (get total-deliveries driver-info) u10) ERR_NOT_AUTHORIZED)
+    (asserts! (>= (get rating driver-info) u4) ERR_NOT_AUTHORIZED)
+    (map-set arbitration-pool tx-sender {
+      available: true,
+      disputes-arbitrated: u0,
+      reputation-score: u100
+    })
+    (ok true)
+  )
+)
+
+(define-public (toggle-arbitrator-availability)
+  (let
+    (
+      (arbitrator-info (unwrap! (map-get? arbitration-pool tx-sender) ERR_NOT_AUTHORIZED))
+    )
+    (map-set arbitration-pool tx-sender (merge arbitrator-info {
+      available: (not (get available arbitrator-info))
+    }))
+    (ok true)
+  )
+)
+
+(define-public (create-dispute (delivery-id uint) (reason (string-ascii 200)))
+  (let
+    (
+      (delivery (unwrap! (map-get? deliveries delivery-id) ERR_DELIVERY_NOT_FOUND))
+      (dispute-id (+ (var-get dispute-counter) u1))
+      (complainant tx-sender)
+      (respondent (if (is-eq tx-sender (get customer delivery))
+                     (unwrap! (get driver delivery) ERR_NOT_DELIVERY_DRIVER)
+                     (get customer delivery)))
+      (escrowed-amount (get payment delivery))
+    )
+    (asserts! (or (is-eq tx-sender (get customer delivery))
+                  (is-eq (some tx-sender) (get driver delivery))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status delivery) "completed") ERR_DELIVERY_NOT_ASSIGNED)
+    (map-set disputes dispute-id {
+      delivery-id: delivery-id,
+      complainant: complainant,
+      respondent: respondent,
+      reason: reason,
+      status: "open",
+      created-at: stacks-block-height,
+      resolved-at: none,
+      arbitrators: (list),
+      ruling: none,
+      votes-for-complainant: u0,
+      votes-for-respondent: u0,
+      escrowed-amount: escrowed-amount
+    })
+    (var-set dispute-counter dispute-id)
+    (ok dispute-id)
+  )
+)
+
+(define-public (join-arbitration (dispute-id uint))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+      (arbitrator-info (unwrap! (map-get? arbitration-pool tx-sender) ERR_NOT_AUTHORIZED))
+      (current-arbitrators (get arbitrators dispute))
+    )
+    (asserts! (get available arbitrator-info) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status dispute) "open") ERR_DISPUTE_NOT_OPEN)
+    (asserts! (not (is-eq tx-sender (get complainant dispute))) ERR_CANNOT_ARBITRATE_OWN_DISPUTE)
+    (asserts! (not (is-eq tx-sender (get respondent dispute))) ERR_CANNOT_ARBITRATE_OWN_DISPUTE)
+    (asserts! (is-none (index-of current-arbitrators tx-sender)) ERR_ALREADY_ARBITRATOR)
+    (asserts! (< (len current-arbitrators) u5) ERR_INSUFFICIENT_ARBITRATORS)
+    (map-set disputes dispute-id (merge dispute {
+      arbitrators: (unwrap! (as-max-len? (append current-arbitrators tx-sender) u5) ERR_INSUFFICIENT_ARBITRATORS)
+    }))
+    (ok true)
+  )
+)
+
+(define-public (submit-ruling (dispute-id uint) (ruling (string-ascii 20)))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+      (arbitrator-info (unwrap! (map-get? arbitration-pool tx-sender) ERR_NOT_AUTHORIZED))
+      (vote-key { dispute-id: dispute-id, arbitrator: tx-sender })
+    )
+    (asserts! (is-eq (get status dispute) "open") ERR_DISPUTE_NOT_OPEN)
+    (asserts! (is-some (index-of (get arbitrators dispute) tx-sender)) ERR_NOT_ARBITRATOR)
+    (asserts! (>= (len (get arbitrators dispute)) (var-get minimum-arbitrators)) ERR_INSUFFICIENT_ARBITRATORS)
+    (asserts! (is-none (map-get? arbitration-votes vote-key)) ERR_ALREADY_RULED)
+    (asserts! (or (is-eq ruling "complainant") (is-eq ruling "respondent")) ERR_INVALID_RULING)
+    (map-set arbitration-votes vote-key {
+      vote: ruling,
+      timestamp: stacks-block-height
+    })
+    (if (is-eq ruling "complainant")
+      (map-set disputes dispute-id (merge dispute {
+        votes-for-complainant: (+ (get votes-for-complainant dispute) u1)
+      }))
+      (map-set disputes dispute-id (merge dispute {
+        votes-for-respondent: (+ (get votes-for-respondent dispute) u1)
+      }))
+    )
+    (try! (check-and-resolve-dispute dispute-id))
+    (ok true)
+  )
+)
+
+(define-private (check-and-resolve-dispute (dispute-id uint))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+      (total-votes (+ (get votes-for-complainant dispute) (get votes-for-respondent dispute)))
+      (required-votes (/ (len (get arbitrators dispute)) u2))
+      (majority-threshold (+ required-votes u1))
+    )
+    (if (>= total-votes majority-threshold)
+      (begin
+        (if (> (get votes-for-complainant dispute) (get votes-for-respondent dispute))
+          (try! (resolve-dispute dispute-id "complainant"))
+          (try! (resolve-dispute dispute-id "respondent"))
+        )
+        (ok true)
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-private (resolve-dispute (dispute-id uint) (winner (string-ascii 20)))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+      (escrowed-amount (get escrowed-amount dispute))
+      (arbitration-fee (var-get arbitration-reward))
+      (total-fee (* arbitration-fee (len (get arbitrators dispute))))
+      (remaining-amount (- escrowed-amount total-fee))
+      (winner-principal (if (is-eq winner "complainant")
+                          (get complainant dispute)
+                          (get respondent dispute)))
+    )
+    (asserts! (is-eq (get status dispute) "open") ERR_DISPUTE_ALREADY_RESOLVED)
+    (try! (distribute-arbitration-rewards dispute-id))
+    (try! (as-contract (stx-transfer? remaining-amount tx-sender winner-principal)))
+    (map-set disputes dispute-id (merge dispute {
+      status: "resolved",
+      resolved-at: (some stacks-block-height),
+      ruling: (some winner)
+    }))
+    (ok true)
+  )
+)
+
+(define-private (distribute-arbitration-rewards (dispute-id uint))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+      (arbitrators (get arbitrators dispute))
+      (reward-per-arbitrator (var-get arbitration-reward))
+    )
+    (try! (distribute-to-arbitrators arbitrators reward-per-arbitrator))
+    (ok true)
+  )
+)
+
+(define-private (distribute-to-arbitrators (arbitrators (list 5 principal)) (reward uint))
+  (fold distribute-single-reward arbitrators (ok true))
+)
+
+(define-private (distribute-single-reward (arbitrator principal) (prev-result (response bool uint)))
+  (match prev-result
+    success (begin
+      (try! (as-contract (stx-transfer? (var-get arbitration-reward) tx-sender arbitrator)))
+      (match (map-get? arbitration-pool arbitrator)
+        some-info (begin
+          (map-set arbitration-pool arbitrator (merge some-info {
+            disputes-arbitrated: (+ (get disputes-arbitrated some-info) u1),
+            reputation-score: (+ (get reputation-score some-info) u10)
+          }))
+          (ok true)
+        )
+        (ok true)
+      )
+    )
+    error (err error)
+  )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes dispute-id)
+)
+
+(define-read-only (get-arbitrator (arbitrator principal))
+  (map-get? arbitration-pool arbitrator)
+)
+
+(define-read-only (get-arbitration-vote (dispute-id uint) (arbitrator principal))
+  (map-get? arbitration-votes { dispute-id: dispute-id, arbitrator: arbitrator })
+)
+
+(define-read-only (get-dispute-count)
+  (var-get dispute-counter)
+)
+
+(define-read-only (get-arbitration-settings)
+  {
+    minimum-arbitrators: (var-get minimum-arbitrators),
+    arbitration-reward: (var-get arbitration-reward)
+  }
 )
