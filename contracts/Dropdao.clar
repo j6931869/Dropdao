@@ -20,6 +20,9 @@
 (define-constant ERR_NOT_ARBITRATOR (err u118))
 (define-constant ERR_ALREADY_RULED (err u119))
 (define-constant ERR_INVALID_RULING (err u120))
+(define-constant ERR_INVALID_SURGE_MULTIPLIER (err u121))
+(define-constant ERR_INVALID_TIME_SLOT (err u122))
+(define-constant ERR_SURGE_NOT_ACTIVE (err u123))
 
 (define-data-var delivery-counter uint u0)
 (define-data-var proposal-counter uint u0)
@@ -28,6 +31,11 @@
 (define-data-var dispute-counter uint u0)
 (define-data-var minimum-arbitrators uint u3)
 (define-data-var arbitration-reward uint u1000000)
+(define-data-var base-delivery-fee uint u5000000)
+(define-data-var surge-multiplier uint u100)
+(define-data-var peak-hour-start uint u8)
+(define-data-var peak-hour-end uint u18)
+(define-data-var demand-threshold uint u5)
 
 (define-map deliveries
   uint
@@ -107,6 +115,37 @@
 (define-map arbitration-votes
   { dispute-id: uint, arbitrator: principal }
   { vote: (string-ascii 20), timestamp: uint }
+)
+
+(define-map demand-tracking
+  uint
+  {
+    time-slot: uint,
+    pending-deliveries: uint,
+    active-drivers: uint,
+    completed-deliveries: uint,
+    surge-active: bool,
+    surge-rate: uint
+  }
+)
+
+(define-map hourly-demand
+  uint
+  {
+    hour: uint,
+    total-requests: uint,
+    avg-surge: uint
+  }
+)
+
+(define-map surge-history
+  uint
+  {
+    block-height: uint,
+    surge-rate: uint,
+    demand-ratio: uint,
+    active-deliveries: uint
+  }
 )
 
 (define-public (register-driver (name (string-ascii 50)))
@@ -510,3 +549,223 @@
     arbitration-reward: (var-get arbitration-reward)
   }
 )
+
+(define-private (get-time-slot)
+  (mod (/ stacks-block-height u144) u24)
+)
+
+(define-private (is-peak-hour (hour uint))
+  (let
+    (
+      (start-hour (var-get peak-hour-start))
+      (end-hour (var-get peak-hour-end))
+    )
+    (if (< start-hour end-hour)
+      (and (>= hour start-hour) (< hour end-hour))
+      (or (>= hour start-hour) (< hour end-hour))
+    )
+  )
+)
+
+(define-private (count-active-drivers)
+  u5
+)
+
+(define-private (calculate-surge-rate (demand-ratio uint) (peak-multiplier uint))
+  (let
+    (
+      (base-surge (var-get surge-multiplier))
+      (demand-surge (if (> demand-ratio (var-get demand-threshold))
+                      (+ base-surge (* (- demand-ratio (var-get demand-threshold)) u20))
+                      base-surge))
+      (final-surge (/ (* demand-surge peak-multiplier) u100))
+    )
+    (if (> final-surge u500) u500 final-surge)
+  )
+)
+
+(define-public (calculate-surge-pricing (pickup-location (string-ascii 100)) (delivery-location (string-ascii 100)))
+  (let
+    (
+      (current-time-slot (get-time-slot))
+      (pending-count u3)
+      (active-drivers (count-active-drivers))
+      (demand-tracking-data (default-to 
+        { time-slot: current-time-slot, pending-deliveries: u0, active-drivers: u0, completed-deliveries: u0, surge-active: false, surge-rate: u100 }
+        (map-get? demand-tracking current-time-slot)))
+      (demand-ratio (if (> active-drivers u0) (/ pending-count active-drivers) u10))
+      (peak-multiplier (if (is-peak-hour current-time-slot) u150 u100))
+      (surge-rate (calculate-surge-rate demand-ratio peak-multiplier))
+      (base-fee (var-get base-delivery-fee))
+      (final-price (/ (* base-fee surge-rate) u100))
+    )
+    (update-demand-tracking current-time-slot pending-count active-drivers surge-rate)
+    (ok { 
+      base-price: base-fee,
+      surge-rate: surge-rate,
+      final-price: final-price,
+      demand-ratio: demand-ratio,
+      is-surge-active: (> surge-rate u100)
+    })
+  )
+)
+
+(define-public (create-delivery-with-surge (pickup-location (string-ascii 100)) (delivery-location (string-ascii 100)))
+  (let
+    (
+      (current-time-slot (get-time-slot))
+      (pending-count u3)
+      (active-drivers (count-active-drivers))
+      (demand-ratio (if (> active-drivers u0) (/ pending-count active-drivers) u10))
+      (peak-multiplier (if (is-peak-hour current-time-slot) u150 u100))
+      (surge-rate (calculate-surge-rate demand-ratio peak-multiplier))
+      (base-fee (var-get base-delivery-fee))
+      (final-price (/ (* base-fee surge-rate) u100))
+      (delivery-id (+ (var-get delivery-counter) u1))
+    )
+    (asserts! (> final-price u0) ERR_INVALID_DELIVERY)
+    (try! (stx-transfer? final-price tx-sender (as-contract tx-sender)))
+    (map-set deliveries delivery-id {
+      customer: tx-sender,
+      pickup-location: pickup-location,
+      delivery-location: delivery-location,
+      payment: final-price,
+      driver: none,
+      status: "pending",
+      created-at: stacks-block-height,
+      completed-at: none
+    })
+    (var-set delivery-counter delivery-id)
+    (simple-record-surge-history surge-rate pending-count)
+    (ok { delivery-id: delivery-id, surge-applied: surge-rate, total-paid: final-price })
+  )
+)
+
+(define-public (set-surge-parameters (new-base-fee uint) (new-peak-start uint) (new-peak-end uint) (new-demand-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-base-fee u0) ERR_INVALID_DELIVERY)
+    (asserts! (and (< new-peak-start u24) (< new-peak-end u24)) ERR_INVALID_TIME_SLOT)
+    (asserts! (> new-demand-threshold u0) ERR_INVALID_DELIVERY)
+    (var-set base-delivery-fee new-base-fee)
+    (var-set peak-hour-start new-peak-start)
+    (var-set peak-hour-end new-peak-end)
+    (var-set demand-threshold new-demand-threshold)
+    (ok true)
+  )
+)
+
+(define-public (update-surge-multiplier (new-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (and (>= new-multiplier u50) (<= new-multiplier u500)) ERR_INVALID_SURGE_MULTIPLIER)
+    (var-set surge-multiplier new-multiplier)
+    (ok true)
+  )
+)
+
+
+
+
+(define-private (update-demand-tracking (time-slot uint) (pending uint) (active uint) (surge uint))
+  (let
+    (
+      (existing-data (default-to 
+        { time-slot: time-slot, pending-deliveries: u0, active-drivers: u0, completed-deliveries: u0, surge-active: false, surge-rate: u100 }
+        (map-get? demand-tracking time-slot)))
+    )
+    (map-set demand-tracking time-slot {
+      time-slot: time-slot,
+      pending-deliveries: pending,
+      active-drivers: active,
+      completed-deliveries: (get completed-deliveries existing-data),
+      surge-active: (> surge u100),
+      surge-rate: surge
+    })
+    (update-hourly-demand time-slot surge)
+    true
+  )
+)
+
+(define-private (update-hourly-demand (hour uint) (surge uint))
+  (let
+    (
+      (existing-hourly (default-to 
+        { hour: hour, total-requests: u0, avg-surge: u100 }
+        (map-get? hourly-demand hour)))
+      (new-total (+ (get total-requests existing-hourly) u1))
+      (new-avg (if (> new-total u0) 
+                 (/ (+ (* (get avg-surge existing-hourly) (get total-requests existing-hourly)) surge) new-total)
+                 surge))
+    )
+    (map-set hourly-demand hour {
+      hour: hour,
+      total-requests: new-total,
+      avg-surge: new-avg
+    })
+    true
+  )
+)
+
+(define-private (simple-record-surge-history (surge-rate uint) (pending-count uint))
+  (let
+    (
+      (history-id stacks-block-height)
+      (active-drivers (count-active-drivers))
+      (demand-ratio (if (> active-drivers u0) (/ pending-count active-drivers) u0))
+    )
+    (map-set surge-history history-id {
+      block-height: stacks-block-height,
+      surge-rate: surge-rate,
+      demand-ratio: demand-ratio,
+      active-deliveries: pending-count
+    })
+    true
+  )
+)
+
+(define-read-only (get-current-surge)
+  (let
+    (
+      (current-time-slot (get-time-slot))
+      (pending-count u3)
+      (active-drivers (count-active-drivers))
+      (demand-ratio (if (> active-drivers u0) (/ pending-count active-drivers) u10))
+      (peak-multiplier (if (is-peak-hour current-time-slot) u150 u100))
+      (surge-rate (calculate-surge-rate demand-ratio peak-multiplier))
+    )
+    {
+      time-slot: current-time-slot,
+      pending-deliveries: pending-count,
+      active-drivers: active-drivers,
+      demand-ratio: demand-ratio,
+      surge-rate: surge-rate,
+      is-peak: (is-peak-hour current-time-slot),
+      base-fee: (var-get base-delivery-fee)
+    }
+  )
+)
+
+(define-read-only (get-demand-tracking-data (time-slot uint))
+  (map-get? demand-tracking time-slot)
+)
+
+(define-read-only (get-hourly-demand-data (hour uint))
+  (map-get? hourly-demand hour)
+)
+
+(define-read-only (get-surge-history (block-heightt uint))
+  (map-get? surge-history stacks-block-height)
+)
+
+(define-read-only (get-surge-settings)
+  {
+    base-fee: (var-get base-delivery-fee),
+    surge-multiplier: (var-get surge-multiplier),
+    peak-start: (var-get peak-hour-start),
+    peak-end: (var-get peak-hour-end),
+    demand-threshold: (var-get demand-threshold)
+  }
+)
+
+
